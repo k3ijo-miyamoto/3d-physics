@@ -54,8 +54,8 @@ struct Camera { viewProj: mat4x4f, view: mat4x4f, eyePos: vec4f }
 @group(0) @binding(0) var<uniform> cam: Camera;
 
 const VERTS = array<vec2f, 6>(
-  vec2f(-30, -30), vec2f(30, -30), vec2f(-30, 30),
-  vec2f(-30, 30), vec2f(30, -30), vec2f(30, 30),
+  vec2f(-100, -100), vec2f(100, -100), vec2f(-100, 100),
+  vec2f(-100, 100), vec2f(100, -100), vec2f(100, 100),
 );
 
 struct FOut { @builtin(position) pos: vec4f, @location(0) xz: vec2f }
@@ -244,7 +244,7 @@ export class WebGPUSceneRenderer {
   private updateCamera(): void {
     const eye  = this.getEye();
     const view = lookAtMat4(eye, this.tgt, [0, 1, 0]);
-    const proj = perspectiveMat4(Math.PI / 3, this.canvas.width / this.canvas.height, 0.1, 200);
+    const proj = perspectiveMat4(Math.PI / 3, this.canvas.width / this.canvas.height, 0.1, 1000);
     const vp   = mat4Mul(proj, view);
     const data = new Float32Array(40);
     data.set(vp, 0); data.set(view, 16); data.set(eye, 32);
@@ -264,10 +264,16 @@ export class WebGPUSceneRenderer {
       this.lastMX = e.clientX; this.lastMY = e.clientY;
     });
     this.canvas.addEventListener('wheel', (e) => {
-      this.dist = Math.max(3, Math.min(200, this.dist + e.deltaY * 0.05));
+      this.dist = Math.max(3, Math.min(800, this.dist + e.deltaY * 0.05));
     }, { passive: true });
-    window.addEventListener('keydown', (e) => { this.keys.add(e.key.toLowerCase()); });
-    window.addEventListener('keyup',   (e) => { this.keys.delete(e.key.toLowerCase()); });
+    window.addEventListener('keydown', (e) => {
+      this.keys.add(e.key.toLowerCase());
+      if (e.key.toLowerCase() === 'r') {
+        this.azimuth = 0.3; this.elevation = 0.5; this.dist = 20;
+        this.tgt[0] = 0; this.tgt[1] = 3; this.tgt[2] = 0;
+      }
+    });
+    window.addEventListener('keyup', (e) => { this.keys.delete(e.key.toLowerCase()); });
   }
 
   private applyWASD(): void {

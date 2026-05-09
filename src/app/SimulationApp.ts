@@ -420,7 +420,7 @@ export class SimulationApp {
     this.dynamicIds.clear();
     resetColorIndex();
 
-    const MAX = 1000000;
+    const MAX = 3000000;
     this.gpuWorld = await GPUPhysicsWorld.create(MAX);
     this.gpuWorld.gravity.y = this.params.gravityY;
     this.gpuWorld.restitution = this.params.restitution;
