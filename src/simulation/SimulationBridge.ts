@@ -21,7 +21,9 @@ type BridgeCommand =
   | { type: 'set_attractors'; points: Array<{ x: number; y: number; z: number; strength: number }> }
   | { type: 'start_spiral_attractors'; centers: Array<{ x: number; y: number; z: number }>; r?: number; omega?: number; strength?: number }
   | { type: 'stop_spiral_attractors' }
-  | { type: 'add_spheres_shell'; count: number; radius?: number; thickness?: number };
+  | { type: 'add_spheres_shell'; count: number; radius?: number; thickness?: number }
+  | { type: 'start_recording'; name?: string; description?: string }
+  | { type: 'stop_recording'; requestId: string };
 
 export interface BridgeHandlers {
   addSphere(height?: number): void;
@@ -51,10 +53,18 @@ export interface BridgeHandlers {
 const WS_URL = 'ws://localhost:5175';
 const RECONNECT_DELAY_MS = 3000;
 
+type RecordedStep = { action: string; params: Record<string, unknown>; wait: number };
+
 export class SimulationBridge {
   private ws: WebSocket | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private disposed = false;
+
+  private recording: RecordedStep[] | null = null;
+  private recordingStart = 0;
+  private recordingName = '';
+  private recordingDescription = '';
+  private lastStepTime = 0;
 
   constructor(private handlers: BridgeHandlers) {
     this.connect();
@@ -89,7 +99,34 @@ export class SimulationBridge {
     }
   }
 
+  private record(action: string, params: Record<string, unknown>): void {
+    if (!this.recording) return;
+    const now = Date.now();
+    const wait = this.recording.length === 0 ? 0 : now - this.lastStepTime;
+    this.lastStepTime = now;
+    this.recording.push({ action, params, wait });
+  }
+
   private async dispatch(cmd: BridgeCommand): Promise<void> {
+    // Recording control — do not record these meta-commands
+    if (cmd.type === 'start_recording') {
+      this.recording = [];
+      this.recordingStart = Date.now();
+      this.lastStepTime = Date.now();
+      this.recordingName = cmd.name ?? 'recorded';
+      this.recordingDescription = cmd.description ?? '';
+      return;
+    }
+    if (cmd.type === 'stop_recording') {
+      const steps = this.recording ?? [];
+      this.recording = null;
+      this.send({ type: 'recording_response', requestId: cmd.requestId, steps, name: this.recordingName, description: this.recordingDescription });
+      return;
+    }
+
+    // Capture command before dispatching
+    this.captureForRecording(cmd);
+
     switch (cmd.type) {
       case 'add_sphere':         this.handlers.addSphere(cmd.height); break;
       case 'add_spheres_bulk':   this.handlers.addSpheresBulk(cmd.count, cmd.height); break;
@@ -117,6 +154,29 @@ export class SimulationBridge {
         break;
       }
     }
+  }
+
+  private captureForRecording(cmd: BridgeCommand): void {
+    if (!this.recording) return;
+    const now = Date.now();
+    const wait = this.recording.length === 0 ? 0 : now - this.lastStepTime;
+    this.lastStepTime = now;
+    let action = cmd.type;
+    let params: Record<string, unknown> = {};
+
+    if (cmd.type === 'add_sphere')          params = { height: cmd.height };
+    else if (cmd.type === 'add_spheres_bulk') params = { count: cmd.count, height: cmd.height };
+    else if (cmd.type === 'add_spheres_shell') params = { count: cmd.count, radius: cmd.radius, thickness: cmd.thickness };
+    else if (cmd.type === 'remove_spheres') params = { count: cmd.count };
+    else if (cmd.type === 'set_gravity')    params = { y: cmd.y };
+    else if (cmd.type === 'set_restitution') params = { value: cmd.value };
+    else if (cmd.type === 'set_damping')    params = { value: cmd.value };
+    else if (cmd.type === 'apply_force_field') { action = `apply_${cmd.field.type}`; params = cmd.field as unknown as Record<string, unknown>; }
+    else if (cmd.type === 'set_attractors') params = { points: cmd.points };
+    else if (cmd.type === 'start_spiral_attractors') params = { centers: cmd.centers, r: cmd.r, omega: cmd.omega, strength: cmd.strength };
+    else if (cmd.type === 'set_sphere_radius') params = { value: cmd.value };
+
+    this.recording.push({ action, params, wait });
   }
 
   private send(payload: unknown): void {
