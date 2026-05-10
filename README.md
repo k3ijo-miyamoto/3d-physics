@@ -18,8 +18,6 @@ Simulate up to **3 million spheres** in real time, and control the simulation li
 - **Scenario system** — record and replay command sequences as JSON
 - **CPU fallback** — Three.js renderer for environments without WebGPU
 
-![alt text](image.png)
-
 ## Demo
 
 [![3D WebGPU Physics Simulation — 3M spheres, attractor spiral & black hole](https://img.youtube.com/vi/dLX3tjRpqsg/maxresdefault.jpg)](https://www.youtube.com/watch?v=dLX3tjRpqsg)
@@ -189,7 +187,7 @@ WebGPU compute shader と TypeScript で構築した、AI制御対応の大規�
 - **シナリオシステム** — コマンドシーケンスを JSON として録音・再生
 - **CPU フォールバック** — WebGPU 非対応環境向けの Three.js レンダラー
 
-## デモ
+## デモ（下のサムネをクリック youtubeへ飛びます）
 
 [![3D WebGPU 物理シミュレーション — 300万球、引力スパイラル＆ブラックホール](https://img.youtube.com/vi/dLX3tjRpqsg/maxresdefault.jpg)](https://www.youtube.com/watch?v=dLX3tjRpqsg)
 
