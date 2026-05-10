@@ -23,7 +23,8 @@ type BridgeCommand =
   | { type: 'stop_spiral_attractors' }
   | { type: 'add_spheres_shell'; count: number; radius?: number; thickness?: number }
   | { type: 'start_recording'; name?: string; description?: string }
-  | { type: 'stop_recording'; requestId: string };
+  | { type: 'stop_recording'; requestId: string }
+  | { type: 'set_attractor_slot'; index: number; x: number; y: number; z: number; strength: number };
 
 export interface BridgeHandlers {
   addSphere(height?: number): void;
@@ -47,6 +48,7 @@ export interface BridgeHandlers {
   startSpiralAttractors(centers: Array<{ x: number; y: number; z: number }>, r?: number, omega?: number, strength?: number): void;
   stopSpiralAttractors(): void;
   addSpheresShell(count: number, radius: number, thickness: number): void;
+  setAttractorSlot(index: number, x: number, y: number, z: number, strength: number): void;
   onConnectionChange(connected: boolean): void;
 }
 
@@ -148,6 +150,7 @@ export class SimulationBridge {
       case 'start_spiral_attractors': this.handlers.startSpiralAttractors(cmd.centers, cmd.r, cmd.omega, cmd.strength); break;
       case 'stop_spiral_attractors':  this.handlers.stopSpiralAttractors(); break;
       case 'add_spheres_shell':        this.handlers.addSpheresShell(cmd.count, cmd.radius ?? 120, cmd.thickness ?? 5); break;
+      case 'set_attractor_slot':       this.handlers.setAttractorSlot(cmd.index, cmd.x, cmd.y, cmd.z, cmd.strength); break;
       case 'get_state': {
         const state = await this.handlers.getState();
         this.send({ type: 'state_response', requestId: cmd.requestId, state });
@@ -175,6 +178,7 @@ export class SimulationBridge {
     else if (cmd.type === 'set_attractors') params = { points: cmd.points };
     else if (cmd.type === 'start_spiral_attractors') params = { centers: cmd.centers, r: cmd.r, omega: cmd.omega, strength: cmd.strength };
     else if (cmd.type === 'set_sphere_radius') params = { value: cmd.value };
+    else if (cmd.type === 'set_attractor_slot') params = { index: cmd.index, x: cmd.x, y: cmd.y, z: cmd.z, strength: cmd.strength };
 
     this.recording.push({ action, params, wait });
   }

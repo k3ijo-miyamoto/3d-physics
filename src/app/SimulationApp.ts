@@ -116,9 +116,12 @@ export class SimulationApp {
     this.nlPanel = new NLControlPanel(container, {
       onClearEffects: () => {
         this.world.clearForceFields();
+        this.attractorBodies = null;
+        this.spiralAttractors = null;
         if (this.gpuWorld) {
           this.gpuWorld.wind = { x: 0, y: 0, z: 0 };
           this.gpuWorld.vortex = { centerX: 0, centerZ: 0, tangentialStrength: 0, inwardStrength: 0, liftStrength: 0, centerY: 30, yConfinementStr: 0, enabled: false };
+          this.gpuWorld.attractors = Array.from({ length: 64 }, () => ({ x: 0, y: 0, z: 0, strength: 0 }));
         }
       },
     });
@@ -243,7 +246,7 @@ export class SimulationApp {
         if (this.gpuWorld) {
           this.gpuWorld.wind = { x: 0, y: 0, z: 0 };
           this.gpuWorld.vortex = { centerX: 0, centerZ: 0, tangentialStrength: 0, inwardStrength: 0, liftStrength: 0, centerY: 30, yConfinementStr: 0, enabled: false };
-          this.gpuWorld.attractors = Array.from({ length: 32 }, () => ({ x: 0, y: 0, z: 0, strength: 0 }));
+          this.gpuWorld.attractors = Array.from({ length: 64 }, () => ({ x: 0, y: 0, z: 0, strength: 0 }));
         }
       },
       removeWalls: () => this.removeWalls(),
@@ -256,6 +259,9 @@ export class SimulationApp {
       startSpiralAttractors: (centers, r, omega, strength) => this.startSpiralAttractors(centers, r, omega, strength),
       stopSpiralAttractors: () => this.stopSpiralAttractors(),
       addSpheresShell: (count, radius, thickness) => this.addSpheresShell(count, radius, thickness),
+      setAttractorSlot: (index, x, y, z, strength) => {
+        if (this.gpuWorld) this.gpuWorld.attractors[index] = { x, y, z, strength };
+      },
       getState: async () => ({
         sphereCount: this.gpuWorld ? this.gpuWorld.count : this.dynamicIds.size,
         gpuMode: !!this.gpuWorld,
