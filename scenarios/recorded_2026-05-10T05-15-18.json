@@ -14,7 +14,7 @@
         "radius": 120,
         "thickness": 8
       },
-      "wait": 5679
+      "wait": 2000 
     },
     {
       "action": "set_attractors",
@@ -406,7 +406,7 @@
           }
         ]
       },
-      "wait": 40795
+      "wait": 5000 
     },
     {
       "action": "start_spiral_attractors",

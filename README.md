@@ -18,6 +18,7 @@ Simulate up to **3 million spheres** in real time, and control the simulation li
 - **Scenario system** — record and replay command sequences as JSON
 - **CPU fallback** — Three.js renderer for environments without WebGPU
 
+![alt text](image.png)
 ---
 
 ## Requirements
