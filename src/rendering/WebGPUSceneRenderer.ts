@@ -220,6 +220,8 @@ export class WebGPUSceneRenderer {
 
   private camBuf: GPUBuffer;
   private depthTex: GPUTexture | null = null;
+  private msaaTex: GPUTexture | null = null;
+  private readonly MSAA = 4;
 
   private spherePipeline: GPURenderPipeline;
   private floorPipeline: GPURenderPipeline;
@@ -270,6 +272,7 @@ export class WebGPUSceneRenderer {
     ]});
 
     const depth: GPUDepthStencilState = { format: 'depth24plus', depthWriteEnabled: true, depthCompare: 'less' };
+    const msaa = { count: this.MSAA as GPUSize32 };
     const sphereMod = device.createShaderModule({ code: SPHERE_WGSL });
     const floorMod  = device.createShaderModule({ code: FLOOR_WGSL });
 
@@ -279,6 +282,7 @@ export class WebGPUSceneRenderer {
       fragment: { module: sphereMod, entryPoint: 'fs', targets: [{ format: this.format }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: depth,
+      multisample: msaa,
     });
     this.floorPipeline = device.createRenderPipeline({
       layout: device.createPipelineLayout({ bindGroupLayouts: [camBGL] }),
@@ -286,6 +290,7 @@ export class WebGPUSceneRenderer {
       fragment: { module: floorMod, entryPoint: 'fs', targets: [{ format: this.format }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: depth,
+      multisample: msaa,
     });
 
     this.sphereBG0 = device.createBindGroup({ layout: bodiesBGL, entries: [{ binding: 0, resource: { buffer: bodyBuf } }] });
@@ -306,6 +311,7 @@ export class WebGPUSceneRenderer {
       fragment: { module: atrMod, entryPoint: 'fs', targets: [{ format: this.format, blend: { color: additive, alpha: additive } }] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
+      multisample: msaa,
     });
     this.attractorBG0 = device.createBindGroup({ layout: atrBGL, entries: [{ binding: 0, resource: { buffer: this.attractorBuf } }] });
     this.attractorBG1 = device.createBindGroup({ layout: camBGL, entries: [{ binding: 0, resource: { buffer: this.camBuf } }] });
@@ -323,9 +329,15 @@ export class WebGPUSceneRenderer {
 
   private createDepthTex(): void {
     this.depthTex?.destroy();
+    this.msaaTex?.destroy();
+    const w = this.canvas.width;
+    const h = this.canvas.height;
     this.depthTex = this.device.createTexture({
-      size: [this.canvas.width, this.canvas.height],
-      format: 'depth24plus',
+      size: [w, h], format: 'depth24plus', sampleCount: this.MSAA,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT,
+    });
+    this.msaaTex = this.device.createTexture({
+      size: [w, h], format: this.format, sampleCount: this.MSAA,
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     });
   }
@@ -412,9 +424,10 @@ export class WebGPUSceneRenderer {
     const enc  = this.device.createCommandEncoder();
     const pass = enc.beginRenderPass({
       colorAttachments: [{
-        view: swapTex.createView(),
+        view: this.msaaTex!.createView(),
+        resolveTarget: swapTex.createView(),
         clearValue: { r: 0.07, g: 0.07, b: 0.11, a: 1 },
-        loadOp: 'clear', storeOp: 'store',
+        loadOp: 'clear', storeOp: 'discard',
       }],
       depthStencilAttachment: {
         view: this.depthTex.createView(),
@@ -447,6 +460,7 @@ export class WebGPUSceneRenderer {
 
   dispose(): void {
     this.depthTex?.destroy();
+    this.msaaTex?.destroy();
     this.camBuf.destroy();
     this.canvas.remove();
   }

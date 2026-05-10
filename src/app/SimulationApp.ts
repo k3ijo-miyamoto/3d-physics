@@ -262,14 +262,23 @@ export class SimulationApp {
       setAttractorSlot: (index, x, y, z, strength) => {
         if (this.gpuWorld) this.gpuWorld.attractors[index] = { x, y, z, strength };
       },
-      getState: async () => ({
+      getState: async () => {
+        const gravityY = this.world.gravity.y;
+        const [gpuStats, histogram] = this.gpuWorld
+          ? await Promise.all([
+              this.gpuWorld.computeStats(gravityY),
+              this.gpuWorld.computeHistogram(),
+            ])
+          : [null, null];
+        return ({
         sphereCount: this.gpuWorld ? this.gpuWorld.count : this.dynamicIds.size,
         gpuMode: !!this.gpuWorld,
-        gravityY: this.world.gravity.y,
+        gravityY,
         running: this.running,
         activeFields: this.world.forceFields.map((f) => ({ type: f.type, duration: f.duration })),
         attractors: this.gpuWorld ? this.gpuWorld.attractors : [],
-        gpuStats: this.gpuWorld ? await this.gpuWorld.computeStats() : null,
+        gpuStats,
+        histogram,
         bodies: this.gpuWorld ? [] : this.world.bodies
           .filter((b) => b.type === 'dynamic')
           .map((b) => ({
@@ -277,7 +286,8 @@ export class SimulationApp {
             pos: [+b.position.x.toFixed(2), +b.position.y.toFixed(2), +b.position.z.toFixed(2)],
             vel: [+b.velocity.x.toFixed(2), +b.velocity.y.toFixed(2), +b.velocity.z.toFixed(2)],
           })),
-      }),
+        });
+      },
       onConnectionChange: (connected) => this.nlPanel.setMcpConnected(connected),
     });
 

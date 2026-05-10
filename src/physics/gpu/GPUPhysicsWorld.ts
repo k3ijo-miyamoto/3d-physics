@@ -268,21 +268,24 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 // ---------------------------------------------------------------------------
 // WGSL: Stats reduction — computes per-workgroup partial stats,
 //       then CPU sums 256 partials. Called only on demand (MCP get_state).
+//       statsParams: x=count(f32), y=abs(gravityY) for PE calculation
 // ---------------------------------------------------------------------------
 const STATS_WG = 256; // workgroup count — 256×64 = 16384 threads cover 3M bodies in ~183 iters each
 const STATS_BYTES = STATS_WG * 8 * 4; // 8 f32 per workgroup × 256 × 4 bytes = 8192 bytes
 
 const STATS_WGSL = /* wgsl */`
 struct Body { pos: vec4f, vel: vec4f }
-struct WGStats { sumSpeed: f32, maxSpeed: f32, sumKE: f32, sumPx: f32, sumPy: f32, sumPz: f32, count: f32, _pad: f32 }
+// Layout: [sumSpeed, maxSpeed, sumKE, sumPE, sumPx, sumPy, sumPz, count]
+struct WGStats { sumSpeed: f32, maxSpeed: f32, sumKE: f32, sumPE: f32, sumPx: f32, sumPy: f32, sumPz: f32, count: f32 }
 
-@group(0) @binding(0) var<storage, read>       bodies  : array<Body>;
-@group(0) @binding(1) var<storage, read_write> statsOut: array<WGStats>;
-@group(0) @binding(2) var<uniform>             countVec: vec4u;
+@group(0) @binding(0) var<storage, read>       bodies    : array<Body>;
+@group(0) @binding(1) var<storage, read_write> statsOut  : array<WGStats>;
+@group(0) @binding(2) var<uniform>             statsParams: vec4f; // x=count, y=abs(gravityY)
 
 var<workgroup> wgSpeed: array<f32, 64>;
 var<workgroup> wgMaxSp: array<f32, 64>;
 var<workgroup> wgKE   : array<f32, 64>;
+var<workgroup> wgPE   : array<f32, 64>;
 var<workgroup> wgPx   : array<f32, 64>;
 var<workgroup> wgPy   : array<f32, 64>;
 var<workgroup> wgPz   : array<f32, 64>;
@@ -294,11 +297,12 @@ fn main(
   @builtin(local_invocation_id)  lid: vec3u,
   @builtin(workgroup_id)         wid: vec3u,
 ) {
-  let tid    = lid.x;
-  let N      = countVec.x;
-  let stride = ${STATS_WG}u * 64u;
+  let tid     = lid.x;
+  let N       = u32(statsParams.x);
+  let gravAbs = statsParams.y;
+  let stride  = ${STATS_WG}u * 64u;
 
-  var sp = 0.0; var mx = 0.0; var ke = 0.0;
+  var sp = 0.0; var mx = 0.0; var ke = 0.0; var pe = 0.0;
   var px = 0.0; var py = 0.0; var pz = 0.0; var cnt = 0.0;
 
   var i = gid.x;
@@ -306,11 +310,13 @@ fn main(
     let b    = bodies[i];
     let invM = b.vel.w;
     if (invM > 0.0) {
-      let v2 = dot(b.vel.xyz, b.vel.xyz);
-      let s  = sqrt(v2);
+      let v2   = dot(b.vel.xyz, b.vel.xyz);
+      let s    = sqrt(v2);
+      let mass = 1.0 / invM;
       sp  += s;
       mx   = max(mx, s);
-      ke  += 0.5 * v2 / invM;  // 0.5 * mass * v²
+      ke  += 0.5 * mass * v2;       // KE = 0.5 * mass * v²
+      pe  += mass * gravAbs * b.pos.y; // PE = mass * |g| * y
       px  += b.pos.x;
       py  += b.pos.y;
       pz  += b.pos.z;
@@ -319,7 +325,7 @@ fn main(
     i += stride;
   }
 
-  wgSpeed[tid] = sp; wgMaxSp[tid] = mx; wgKE[tid] = ke;
+  wgSpeed[tid] = sp; wgMaxSp[tid] = mx; wgKE[tid] = ke; wgPE[tid] = pe;
   wgPx[tid] = px; wgPy[tid] = py; wgPz[tid] = pz; wgCnt[tid] = cnt;
   workgroupBarrier();
 
@@ -328,6 +334,7 @@ fn main(
       wgSpeed[tid] += wgSpeed[tid + s];
       wgMaxSp[tid]  = max(wgMaxSp[tid], wgMaxSp[tid + s]);
       wgKE[tid]    += wgKE[tid + s];
+      wgPE[tid]    += wgPE[tid + s];
       wgPx[tid]    += wgPx[tid + s];
       wgPy[tid]    += wgPy[tid + s];
       wgPz[tid]    += wgPz[tid + s];
@@ -338,13 +345,40 @@ fn main(
 
   if (tid == 0u) {
     var out: WGStats;
-    out.sumSpeed = wgSpeed[0]; out.maxSpeed = wgMaxSp[0]; out.sumKE = wgKE[0];
+    out.sumSpeed = wgSpeed[0]; out.maxSpeed = wgMaxSp[0];
+    out.sumKE = wgKE[0]; out.sumPE = wgPE[0];
     out.sumPx = wgPx[0]; out.sumPy = wgPy[0]; out.sumPz = wgPz[0];
-    out.count = wgCnt[0]; out._pad = 0.0;
+    out.count = wgCnt[0];
     statsOut[wid.x] = out;
   }
 }
 `;
+
+// ---------------------------------------------------------------------------
+// WGSL: Speed histogram — bins each body's speed into HIST_BINS buckets,
+//       using atomic counters. Called only on demand (MCP get_state).
+//       histParams: x=count(f32), y=maxSpeed, z=numBins(f32)
+// ---------------------------------------------------------------------------
+const HIST_BINS = 32;
+const HIST_MAX_SPEED = 30.0; // m/s — speeds above this go into the last bin
+
+const HISTOGRAM_WGSL = /* wgsl */`
+struct Body { pos: vec4f, vel: vec4f }
+@group(0) @binding(0) var<storage, read>       bodies    : array<Body>;
+@group(0) @binding(1) var<storage, read_write> bins      : array<atomic<u32>>;
+@group(0) @binding(2) var<uniform>             histParams: vec4f; // x=count, y=maxSpeed, z=numBins
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u) {
+  let i = gid.x;
+  if (f32(i) >= histParams.x) { return; }
+  let b = bodies[i];
+  if (b.vel.w == 0.0) { return; }
+  let speed   = length(b.vel.xyz);
+  let numBins = u32(histParams.z);
+  let bin     = min(u32(speed / histParams.y * histParams.z), numBins - 1u);
+  atomicAdd(&bins[bin], 1u);
+}`;
 
 // ---------------------------------------------------------------------------
 // WGSL: Set all bodies' radius in one pass
@@ -401,6 +435,13 @@ export class GPUPhysicsWorld {
   private statsReadBuf: GPUBuffer;
   private statsParamBuf: GPUBuffer;
   private statsBG: GPUBindGroup;
+
+  // Speed histogram (on-demand, for MCP get_state)
+  private histPipe: GPUComputePipeline;
+  private histBinBuf: GPUBuffer;
+  private histReadBuf: GPUBuffer;
+  private histParamBuf: GPUBuffer;
+  private histBG: GPUBindGroup;
 
   readonly maxBodies: number;
   count = 0;
@@ -542,6 +583,31 @@ export class GPUPhysicsWorld {
       { binding: 0, resource: { buffer: this.bodyBuf } },
       { binding: 1, resource: { buffer: this.statsBuf } },
       { binding: 2, resource: { buffer: this.statsParamBuf } },
+    ]});
+
+    // Speed histogram pipeline
+    const histBGL = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ]});
+    this.histPipe = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [histBGL] }),
+      compute: { module: shader(HISTOGRAM_WGSL), entryPoint: 'main' },
+    });
+    this.histBinBuf = device.createBuffer({
+      size: HIST_BINS * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+    });
+    this.histReadBuf = device.createBuffer({
+      size: HIST_BINS * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    this.histParamBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.histBG = device.createBindGroup({ layout: histBGL, entries: [
+      { binding: 0, resource: { buffer: this.bodyBuf } },
+      { binding: 1, resource: { buffer: this.histBinBuf } },
+      { binding: 2, resource: { buffer: this.histParamBuf } },
     ]});
   }
 
@@ -708,13 +774,21 @@ export class GPUPhysicsWorld {
   get gpuDevice(): GPUDevice { return this.device; }
   get bodyBuffer(): GPUBuffer { return this.bodyBuf; }
 
-  async computeStats(): Promise<{
+  async computeStats(gravityY = -9.81): Promise<{
     count: number; avgSpeed: number; maxSpeed: number;
-    totalKE: number; centerOfMass: [number, number, number];
+    totalKE: number; totalPE: number; totalEnergy: number;
+    centerOfMass: [number, number, number];
   }> {
-    if (this.count === 0) return { count: 0, avgSpeed: 0, maxSpeed: 0, totalKE: 0, centerOfMass: [0, 0, 0] };
+    if (this.count === 0) return {
+      count: 0, avgSpeed: 0, maxSpeed: 0,
+      totalKE: 0, totalPE: 0, totalEnergy: 0, centerOfMass: [0, 0, 0],
+    };
 
-    this.device.queue.writeBuffer(this.statsParamBuf, 0, new Uint32Array([this.count, 0, 0, 0]));
+    // Pass count and |gravityY| to shader for PE calculation
+    this.device.queue.writeBuffer(
+      this.statsParamBuf, 0,
+      new Float32Array([this.count, Math.abs(gravityY), 0, 0]),
+    );
 
     const enc = this.device.createCommandEncoder();
     const pass = enc.beginComputePass();
@@ -730,24 +804,63 @@ export class GPUPhysicsWorld {
     this.statsReadBuf.unmap();
 
     // Reduce 256 workgroup partials on CPU
-    let sumSpeed = 0, maxSpeed = 0, sumKE = 0, sumPx = 0, sumPy = 0, sumPz = 0, count = 0;
+    // Struct layout: [sumSpeed, maxSpeed, sumKE, sumPE, sumPx, sumPy, sumPz, count]
+    let sumSpeed = 0, maxSpeed = 0, sumKE = 0, sumPE = 0;
+    let sumPx = 0, sumPy = 0, sumPz = 0, count = 0;
     for (let i = 0; i < STATS_WG; i++) {
       const b = i * 8;
       sumSpeed += data[b + 0];
       maxSpeed  = Math.max(maxSpeed, data[b + 1]);
       sumKE    += data[b + 2];
-      sumPx    += data[b + 3];
-      sumPy    += data[b + 4];
-      sumPz    += data[b + 5];
-      count    += data[b + 6];
+      sumPE    += data[b + 3];
+      sumPx    += data[b + 4];
+      sumPy    += data[b + 5];
+      sumPz    += data[b + 6];
+      count    += data[b + 7];
     }
     const n = count || 1;
+    const ke = +sumKE.toFixed(1);
+    const pe = +sumPE.toFixed(1);
     return {
       count: this.count,
       avgSpeed: +(sumSpeed / n).toFixed(3),
       maxSpeed: +maxSpeed.toFixed(3),
-      totalKE:  +sumKE.toFixed(1),
+      totalKE: ke,
+      totalPE: pe,
+      totalEnergy: +(ke + pe).toFixed(1),
       centerOfMass: [+(sumPx / n).toFixed(2), +(sumPy / n).toFixed(2), +(sumPz / n).toFixed(2)],
+    };
+  }
+
+  async computeHistogram(maxSpeed = HIST_MAX_SPEED): Promise<{
+    bins: number[]; maxSpeed: number; binWidth: number;
+  }> {
+    if (this.count === 0) return { bins: new Array(HIST_BINS).fill(0), maxSpeed, binWidth: maxSpeed / HIST_BINS };
+
+    // Zero the bin counts before dispatch
+    this.device.queue.writeBuffer(this.histBinBuf, 0, new Uint32Array(HIST_BINS));
+    this.device.queue.writeBuffer(
+      this.histParamBuf, 0,
+      new Float32Array([this.count, maxSpeed, HIST_BINS, 0]),
+    );
+
+    const enc = this.device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.histPipe);
+    pass.setBindGroup(0, this.histBG);
+    pass.dispatchWorkgroups(Math.ceil(this.count / 64));
+    pass.end();
+    enc.copyBufferToBuffer(this.histBinBuf, 0, this.histReadBuf, 0, HIST_BINS * 4);
+    this.device.queue.submit([enc.finish()]);
+
+    await this.histReadBuf.mapAsync(GPUMapMode.READ, 0, HIST_BINS * 4);
+    const raw = new Uint32Array(this.histReadBuf.getMappedRange(0, HIST_BINS * 4).slice(0));
+    this.histReadBuf.unmap();
+
+    return {
+      bins: Array.from(raw),
+      maxSpeed,
+      binWidth: +(maxSpeed / HIST_BINS).toFixed(3),
     };
   }
 
@@ -775,5 +888,8 @@ export class GPUPhysicsWorld {
     this.statsBuf.destroy();
     this.statsReadBuf.destroy();
     this.statsParamBuf.destroy();
+    this.histBinBuf.destroy();
+    this.histReadBuf.destroy();
+    this.histParamBuf.destroy();
   }
 }

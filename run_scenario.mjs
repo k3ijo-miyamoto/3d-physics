@@ -100,6 +100,13 @@ function dispatchStep(step) {
     case 'apply_vortex':
       send({ type: 'apply_force_field', field: { type: 'vortex', center: p.center ?? [0, 30, 0], tangentialStrength: p.tangentialStrength ?? 15, inwardStrength: p.inwardStrength ?? 3, liftStrength: p.liftStrength ?? 0, yConfinementStr: p.yConfinementStr ?? 0, duration: p.duration ?? -1 } });
       break;
+    case 'start_spiral_attractors':
+      send({ type: 'start_spiral_attractors', centers: p.centers ?? [], r: p.r, omega: p.omega, strength: p.strength });
+      break;
+    case 'stop_spiral_attractors': send({ type: 'stop_spiral_attractors' }); break;
+    case 'set_attractor_slot':
+      send({ type: 'set_attractor_slot', index: p.index, x: p.x, y: p.y, z: p.z, strength: p.strength });
+      break;
     case 'pause':              send({ type: 'pause_simulation' }); break;
     case 'resume':             send({ type: 'resume_simulation' }); break;
     case 'reset':              send({ type: 'reset_simulation' }); break;
