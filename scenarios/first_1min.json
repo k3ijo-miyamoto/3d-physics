@@ -2025,35 +2025,7 @@
       "params": {
         "y": 0
       },
-      "wait": 500
-    },
-    {
-      "action": "set_gravity",
-      "params": {
-        "y": -9.8
-      },
-      "wait": 5000
-    },
-    {
-      "action": "set_gravity",
-      "params": {
-        "y": 0
-      },
-      "wait": 500
-    },
-    {
-      "action": "set_gravity",
-      "params": {
-        "y": 9.8
-      },
-      "wait": 3000
-    },
-    {
-      "action": "set_gravity",
-      "params": {
-        "y": 0
-      },
-      "wait": 500
+      "wait": 4000
     },
     {
       "action": "apply_vortex",
