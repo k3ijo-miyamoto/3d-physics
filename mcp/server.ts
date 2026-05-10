@@ -115,6 +115,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'remove_spheres',
+      description: '指定した数の球を削除する（最後に追加した順に削除）',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          count: { type: 'number', description: '削除する球の数' },
+        },
+        required: ['count'],
+      },
+    },
+    {
       name: 'remove_all_spheres',
       description: '全ての球を削除する',
       inputSchema: { type: 'object', properties: {} },
@@ -234,13 +245,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'set_attractors',
-      description: '5つの収斂点（引力ウェル）を設定する。xyz=位置, strength=引力強度 (0=無効)',
+      description: '最大32個の収斂点（引力ウェル）を設定する。xyz=位置, strength=引力強度 (0=無効)',
       inputSchema: {
         type: 'object',
         properties: {
           points: {
             type: 'array',
-            description: '最大5個の引力点。足りない場合は無効(strength=0)で補完',
+            description: '最大32個の引力点。足りない場合は無効(strength=0)で補完',
             items: {
               type: 'object',
               properties: {
@@ -272,8 +283,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     case 'add_sphere': {
       const count = Math.max(1, Math.round(a.count ?? 1));
       // Use bulk command for any count — single GPU write instead of N messages
-      const sent = send({ type: 'add_spheres_bulk', count });
+      const sent = send({ type: 'add_spheres_bulk', count, height: a.height ?? 6 });
       return sent ? ok(`${count} 個の球を追加しました`) : notConnected();
+    }
+    case 'remove_spheres': {
+      const count = Math.max(1, Math.round(a.count ?? 1));
+      return send({ type: 'remove_spheres', count }) ? ok(`${count} 個の球を削除しました`) : notConnected();
     }
     case 'remove_all_spheres':
       return send({ type: 'remove_all_spheres' }) ? ok('全ての球を削除しました') : notConnected();
@@ -347,11 +362,23 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     case 'stop_auto_explosion':
       return send({ type: 'stop_auto_explosion' }) ? ok('自動爆発を停止しました') : notConnected();
 
+    case 'start_spiral_attractors': {
+      const rawC = (req.params.arguments as { centers?: unknown })?.centers;
+      const centers = Array.isArray(rawC) ? rawC as Array<{ x: number; y: number; z: number }> : [];
+      const sa = req.params.arguments as Record<string, number>;
+      return send({ type: 'start_spiral_attractors', centers, r: sa.r, omega: sa.omega, strength: sa.strength })
+        ? ok(`${centers.length} 個の収斂点をらせん運動させます`)
+        : notConnected();
+    }
+
+    case 'stop_spiral_attractors':
+      return send({ type: 'stop_spiral_attractors' }) ? ok('らせん運動を停止しました') : notConnected();
+
     case 'set_attractors': {
       const rawPoints = (req.params.arguments as { points?: unknown })?.points;
       const pts = Array.isArray(rawPoints) ? rawPoints : [];
       const full: Array<{ x: number; y: number; z: number; strength: number }> = [];
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < 32; i++) {
         const p = pts[i] as { x?: number; y?: number; z?: number; strength?: number } | undefined;
         full.push(p ? { x: p.x ?? 0, y: p.y ?? 0, z: p.z ?? 0, strength: p.strength ?? 0 } : { x: 0, y: 0, z: 0, strength: 0 });
       }

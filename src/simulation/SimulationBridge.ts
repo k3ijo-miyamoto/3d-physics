@@ -2,8 +2,9 @@ import type { ForceFieldSpec } from '../physics/ForceField';
 
 type BridgeCommand =
   | { type: 'add_sphere'; height?: number }
-  | { type: 'add_spheres_bulk'; count: number }
+  | { type: 'add_spheres_bulk'; count: number; height?: number }
   | { type: 'remove_all_spheres' }
+  | { type: 'remove_spheres'; count: number }
   | { type: 'reset_simulation' }
   | { type: 'pause_simulation' }
   | { type: 'resume_simulation' }
@@ -17,12 +18,16 @@ type BridgeCommand =
   | { type: 'get_state'; requestId: string }
   | { type: 'start_auto_explosion' }
   | { type: 'stop_auto_explosion' }
-  | { type: 'set_attractors'; points: Array<{ x: number; y: number; z: number; strength: number }> };
+  | { type: 'set_attractors'; points: Array<{ x: number; y: number; z: number; strength: number }> }
+  | { type: 'start_spiral_attractors'; centers: Array<{ x: number; y: number; z: number }>; r?: number; omega?: number; strength?: number }
+  | { type: 'stop_spiral_attractors' }
+  | { type: 'add_spheres_shell'; count: number; radius?: number; thickness?: number };
 
 export interface BridgeHandlers {
   addSphere(height?: number): void;
-  addSpheresBulk(count: number): void;
+  addSpheresBulk(count: number, height?: number): void;
   removeAllSpheres(): void;
+  removeSpheres(count: number): void;
   reset(): void;
   pause(): void;
   resume(): void;
@@ -33,10 +38,13 @@ export interface BridgeHandlers {
   clearEffects(): void;
   removeWalls(): void;
   setSphereRadius(value: number): void;
-  getState(): object;
+  getState(): Promise<object>;
   startAutoExplosion(): void;
   stopAutoExplosion(): void;
   setAttractors(points: Array<{ x: number; y: number; z: number; strength: number }>): void;
+  startSpiralAttractors(centers: Array<{ x: number; y: number; z: number }>, r?: number, omega?: number, strength?: number): void;
+  stopSpiralAttractors(): void;
+  addSpheresShell(count: number, radius: number, thickness: number): void;
   onConnectionChange(connected: boolean): void;
 }
 
@@ -62,11 +70,7 @@ export class SimulationBridge {
       };
 
       this.ws.onmessage = (event: MessageEvent<string>) => {
-        try {
-          this.dispatch(JSON.parse(event.data) as BridgeCommand);
-        } catch {
-          // ignore malformed messages
-        }
+        this.dispatch(JSON.parse(event.data) as BridgeCommand).catch(() => {});
       };
 
       this.ws.onclose = () => {
@@ -85,11 +89,12 @@ export class SimulationBridge {
     }
   }
 
-  private dispatch(cmd: BridgeCommand): void {
+  private async dispatch(cmd: BridgeCommand): Promise<void> {
     switch (cmd.type) {
       case 'add_sphere':         this.handlers.addSphere(cmd.height); break;
-      case 'add_spheres_bulk':   this.handlers.addSpheresBulk(cmd.count); break;
+      case 'add_spheres_bulk':   this.handlers.addSpheresBulk(cmd.count, cmd.height); break;
       case 'remove_all_spheres': this.handlers.removeAllSpheres(); break;
+      case 'remove_spheres':     this.handlers.removeSpheres(cmd.count); break;
       case 'reset_simulation':   this.handlers.reset(); break;
       case 'pause_simulation':   this.handlers.pause(); break;
       case 'resume_simulation':  this.handlers.resume(); break;
@@ -102,9 +107,12 @@ export class SimulationBridge {
       case 'set_sphere_radius':    this.handlers.setSphereRadius(cmd.value); break;
       case 'start_auto_explosion': this.handlers.startAutoExplosion(); break;
       case 'stop_auto_explosion':  this.handlers.stopAutoExplosion(); break;
-      case 'set_attractors':       this.handlers.setAttractors(cmd.points); break;
+      case 'set_attractors':          this.handlers.setAttractors(cmd.points); break;
+      case 'start_spiral_attractors': this.handlers.startSpiralAttractors(cmd.centers, cmd.r, cmd.omega, cmd.strength); break;
+      case 'stop_spiral_attractors':  this.handlers.stopSpiralAttractors(); break;
+      case 'add_spheres_shell':        this.handlers.addSpheresShell(cmd.count, cmd.radius ?? 120, cmd.thickness ?? 5); break;
       case 'get_state': {
-        const state = this.handlers.getState();
+        const state = await this.handlers.getState();
         this.send({ type: 'state_response', requestId: cmd.requestId, state });
         break;
       }

@@ -12,6 +12,7 @@ import { NLControlPanel } from '../ui/NLControlPanel';
 import { SimulationLogger } from '../logging/SimulationLogger';
 import { WebGPUSceneRenderer } from '../rendering/WebGPUSceneRenderer';
 import { SimulationBridge } from '../simulation/SimulationBridge';
+import { AttractorBody, stepAttractorBodies } from '../physics/AttractorBody';
 
 export class SimulationApp {
   private container: HTMLElement;
@@ -40,6 +41,7 @@ export class SimulationApp {
   private readonly WALL_HALF = 28;
   private readonly WALL_HEIGHT = 45;
 
+  private readonly keydownHandlers: Array<(e: KeyboardEvent) => void> = [];
   private running = false;
   private accumulator = 0;
   private lastTime = 0;
@@ -51,6 +53,17 @@ export class SimulationApp {
   private fpsEl: HTMLDivElement;
   private fpsFrames = 0;
   private fpsLast = 0;
+
+  // Animated attractors (spiral motion)
+  private spiralAttractors: Array<{
+    cx: number; cy: number; cz: number;  // orbit center
+    r: number;                            // orbit radius
+    omega: number;                        // angular speed (rad/s)
+    phase: number;                        // initial phase
+    strength: number;
+  }> | null = null;
+  private spiralTime = 0;
+  private attractorBodies: AttractorBody[] | null = null;
 
   private params: SimulationParams = {
     gravityY: -9.81,
@@ -105,7 +118,7 @@ export class SimulationApp {
         this.world.clearForceFields();
         if (this.gpuWorld) {
           this.gpuWorld.wind = { x: 0, y: 0, z: 0 };
-          this.gpuWorld.vortex = { centerX: 0, centerZ: 0, tangentialStrength: 0, inwardStrength: 0, liftStrength: 0, enabled: false };
+          this.gpuWorld.vortex = { centerX: 0, centerZ: 0, tangentialStrength: 0, inwardStrength: 0, liftStrength: 0, centerY: 30, yConfinementStr: 0, enabled: false };
         }
       },
     });
@@ -159,7 +172,8 @@ export class SimulationApp {
         if (height !== undefined) this.params.initialHeight = height;
         this.addSphere();
       },
-      addSpheresBulk: (count) => this.addSpheresBulk(count),
+      addSpheresBulk: (count, height) => this.addSpheresBulk(count, height),
+      removeSpheres: (count) => { if (this.gpuWorld) this.gpuWorld.removeSpheres(count); },
       removeAllSpheres: () => this.removeAllSpheres(),
       reset: () => this.reset(),
       pause: () => { if (this.running) this.togglePause(); },
@@ -197,6 +211,8 @@ export class SimulationApp {
               tangentialStrength: spec.tangentialStrength ?? 15,
               inwardStrength: spec.inwardStrength ?? 3,
               liftStrength: spec.liftStrength ?? 6,
+              centerY: spec.center?.[1] ?? 30,
+              yConfinementStr: spec.yConfinementStr ?? 0,
               enabled: true,
             };
           } else if (spec.type === 'explosion') {
@@ -208,14 +224,26 @@ export class SimulationApp {
               radius: spec.radius ?? 10,
               enabled: true,
             };
+          } else if (spec.type === 'attraction') {
+            const slot = this.gpuWorld.attractors.findIndex((a) => a.strength === 0);
+            if (slot !== -1) {
+              this.gpuWorld.attractors[slot] = {
+                x: spec.center?.[0] ?? 0,
+                y: spec.center?.[1] ?? 5,
+                z: spec.center?.[2] ?? 0,
+                strength: spec.strength ?? 8,
+              };
+            }
           }
         }
       },
       clearEffects: () => {
         this.world.clearForceFields();
+        this.attractorBodies = null;
         if (this.gpuWorld) {
           this.gpuWorld.wind = { x: 0, y: 0, z: 0 };
-          this.gpuWorld.vortex = { centerX: 0, centerZ: 0, tangentialStrength: 0, inwardStrength: 0, liftStrength: 0, enabled: false };
+          this.gpuWorld.vortex = { centerX: 0, centerZ: 0, tangentialStrength: 0, inwardStrength: 0, liftStrength: 0, centerY: 30, yConfinementStr: 0, enabled: false };
+          this.gpuWorld.attractors = Array.from({ length: 32 }, () => ({ x: 0, y: 0, z: 0, strength: 0 }));
         }
       },
       removeWalls: () => this.removeWalls(),
@@ -225,12 +253,17 @@ export class SimulationApp {
       startAutoExplosion: () => this.startAutoExplosion(),
       stopAutoExplosion: () => this.stopAutoExplosion(),
       setAttractors: (points) => this.setAttractors(points),
-      getState: () => ({
+      startSpiralAttractors: (centers, r, omega, strength) => this.startSpiralAttractors(centers, r, omega, strength),
+      stopSpiralAttractors: () => this.stopSpiralAttractors(),
+      addSpheresShell: (count, radius, thickness) => this.addSpheresShell(count, radius, thickness),
+      getState: async () => ({
         sphereCount: this.gpuWorld ? this.gpuWorld.count : this.dynamicIds.size,
         gpuMode: !!this.gpuWorld,
         gravityY: this.world.gravity.y,
         running: this.running,
         activeFields: this.world.forceFields.map((f) => ({ type: f.type, duration: f.duration })),
+        attractors: this.gpuWorld ? this.gpuWorld.attractors : [],
+        gpuStats: this.gpuWorld ? await this.gpuWorld.computeStats() : null,
         bodies: this.gpuWorld ? [] : this.world.bodies
           .filter((b) => b.type === 'dynamic')
           .map((b) => ({
@@ -256,6 +289,19 @@ export class SimulationApp {
     this.addSphere();
     this.start();
     void this.toggleGPU(); // GPU モードをデフォルトで有効化
+
+    // E キーで小規模な自動爆発を切り替え
+    const eHandler = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 'e') {
+        if (this.autoExplosionTimer !== null) {
+          this.stopAutoExplosion();
+        } else {
+          this.startAutoExplosion();
+        }
+      }
+    };
+    window.addEventListener('keydown', eHandler);
+    this.keydownHandlers.push(eHandler);
   }
 
   startAutoExplosion(): void {
@@ -267,11 +313,11 @@ export class SimulationApp {
         x: (Math.random() - 0.5) * spread,
         y: 2 + Math.random() * 10,
         z: (Math.random() - 0.5) * spread,
-        strength: 60,
-        radius: 20,
+        strength: 15,
+        radius: 15,
         enabled: true,
       };
-    }, 5000);
+    }, 3000);
   }
 
   stopAutoExplosion(): void {
@@ -283,9 +329,46 @@ export class SimulationApp {
 
   setAttractors(points: Array<{ x: number; y: number; z: number; strength: number }>): void {
     if (!this.gpuWorld) return;
-    for (let i = 0; i < 5; i++) {
-      this.gpuWorld.attractors[i] = points[i] ?? { x: 0, y: 0, z: 0, strength: 0 };
+    const active = points.filter(p => p.strength > 0);
+    // Preserve velocities for bodies that already exist nearby
+    const prev = this.attractorBodies ?? [];
+    this.attractorBodies = active.map((p, i) => {
+      const near = prev.find(b =>
+        Math.hypot(b.x - p.x, b.y - p.y, b.z - p.z) < 2,
+      );
+      const b = new AttractorBody(p.x, p.y, p.z, 10, p.strength);
+      if (near) {
+        b.vx = near.vx; b.vy = near.vy; b.vz = near.vz;
+      } else {
+        b.vx = (Math.random() - 0.5) * 4;
+        b.vy = Math.random() * 2;
+        b.vz = (Math.random() - 0.5) * 4;
+      }
+      return b;
+    });
+    for (let i = 0; i < 64; i++) {
+      this.gpuWorld.attractors[i] = this.attractorBodies[i]?.toPoint()
+        ?? { x: 0, y: 0, z: 0, strength: 0 };
     }
+  }
+
+  startSpiralAttractors(
+    centers: Array<{ x: number; y: number; z: number }>,
+    r = 6, omega = 0.5, strength = 20,
+  ): void {
+    this.spiralAttractors = centers.map((c, i) => ({
+      cx: c.x, cy: c.y, cz: c.z,
+      r,
+      omega,
+      phase: (i / centers.length) * Math.PI * 2,
+      strength,
+    }));
+    this.spiralTime = 0;
+  }
+
+  stopSpiralAttractors(): void {
+    this.spiralAttractors = null;
+    // 引力点はらせん停止時点の位置をそのまま維持する（リセットしない）
   }
 
   private addFloor(): void {
@@ -344,13 +427,21 @@ export class SimulationApp {
     this.controls.updateSphereCount(this.dynamicIds.size);
   }
 
-  addSpheresBulk(count: number): void {
+  addSpheresBulk(count: number, height = 6): void {
     if (!this.gpuWorld) {
       for (let i = 0; i < count; i++) this.addSphere();
       return;
     }
     const { sphereRadius, sphereMass } = this.params;
-    this.gpuWorld.addBodiesBulk(count, sphereRadius, sphereMass, 54, 0.5, 6, 0);
+    const spread = Math.max(54, height * 4);
+    this.gpuWorld.addBodiesBulk(count, sphereRadius, sphereMass, spread, 1, 60, 0);
+    this.controls.updateSphereCount(this.gpuWorld.count);
+  }
+
+  addSpheresShell(count: number, radius = 120, thickness = 5): void {
+    if (!this.gpuWorld) return;
+    const { sphereRadius, sphereMass } = this.params;
+    this.gpuWorld.addBodiesShell(count, sphereRadius, sphereMass, radius, thickness);
     this.controls.updateSphereCount(this.gpuWorld.count);
   }
 
@@ -544,6 +635,17 @@ export class SimulationApp {
     this.rafId = requestAnimationFrame((t) => this.loop(t));
   }
 
+  dispose(): void {
+    this.running = false;
+    cancelAnimationFrame(this.rafId);
+    this.stopAutoExplosion();
+    this.bridge?.dispose();
+    this.gpuSceneRenderer?.dispose();
+    this.gpuWorld?.destroy();
+    for (const h of this.keydownHandlers) window.removeEventListener('keydown', h);
+    this.keydownHandlers.length = 0;
+  }
+
   private loop = async (now: number): Promise<void> => {
     if (!this.running) return;
 
@@ -560,6 +662,30 @@ export class SimulationApp {
       this.fpsLast = now;
     }
 
+    // Attractor n-body physics
+    if (this.attractorBodies && this.gpuWorld) {
+      stepAttractorBodies(this.attractorBodies, frameDt, this.world.gravity.y);
+      for (let i = 0; i < 64; i++) {
+        this.gpuWorld.attractors[i] = this.attractorBodies[i]?.toPoint()
+          ?? { x: 0, y: 0, z: 0, strength: 0 };
+      }
+    }
+
+    // Animated spiral attractors
+    if (this.spiralAttractors && this.gpuWorld) {
+      this.spiralTime += frameDt;
+      const t = this.spiralTime;
+      this.spiralAttractors.forEach((a, i) => {
+        const angle = a.omega * t + a.phase;
+        this.gpuWorld!.attractors[i] = {
+          x: a.cx + a.r * Math.cos(angle),
+          y: a.cy + a.r * 0.4 * Math.sin(angle * 1.3),
+          z: a.cz + a.r * Math.sin(angle),
+          strength: a.strength,
+        };
+      });
+    }
+
     if (this.gpuWorld) {
       // GPU physics — compute shaders + WebGPU direct render, zero CPU readback
       this.accumulator += frameDt;
@@ -570,6 +696,7 @@ export class SimulationApp {
         this.accumulator -= fixedDt;
       }
       if (this.accumulator > fixedDt * 3) this.accumulator = 0; // reset if too far behind
+      this.gpuSceneRenderer?.setAttractors(this.gpuWorld.attractors, performance.now() / 1000);
       this.gpuSceneRenderer?.render(this.gpuWorld.count);
     } else {
       // CPU physics path

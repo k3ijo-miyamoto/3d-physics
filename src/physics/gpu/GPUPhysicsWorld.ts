@@ -31,7 +31,7 @@ struct Params {
   walls        : vec4f,          // x = halfW, y = halfD, z = enabled(1/0), w = unused
   explosion    : vec4f,          // xyz = center, w = strength
   explosionMeta: vec4f,          // x = radius, y = enabled(1/0), zw = unused
-  attractors   : array<vec4f, 5>, // xyz = position, w = strength (0 = disabled)
+  attractors   : array<vec4f, 64>, // xyz = position, w = strength (0 = disabled)
 }
 `;
 
@@ -69,10 +69,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     if (d2 > 0.0025) {
       let dist = sqrt(d2);
       let rnx = rx / dist; let rnz = rz / dist;
-      b.vel.x += (-rnz * params.vortex.z - rnx * params.vortex.w) * dt;
-      b.vel.z += ( rnx * params.vortex.z - rnz * params.vortex.w) * dt;
+      // tangential: constant magnitude; inward: spring force (proportional to distance)
+      b.vel.x += (-rnz * params.vortex.z - rx * params.vortex.w) * dt;
+      b.vel.z += ( rnx * params.vortex.z - rz * params.vortex.w) * dt;
       b.vel.y += params.vortexExtra.x * exp(-d2 / 2500.0) * dt;
     }
+    // Y-axis confinement: pull toward centerY (vortexExtra.z) with strength (vortexExtra.w)
+    b.vel.y += (params.vortexExtra.z - b.pos.y) * params.vortexExtra.w * dt;
   }
 
   // Damping
@@ -99,14 +102,13 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     }
   }
 
-  // Attractors (up to 5 gravity wells) — inverse-square law so nearest wins
-  for (var ai = 0u; ai < 5u; ai++) {
+  // Attractors (up to 32 gravity wells)
+  for (var ai = 0u; ai < 64u; ai++) {
     let atr = params.attractors[ai];
     if (atr.w == 0.0) { continue; }
-    let d     = atr.xyz - b.pos.xyz;
-    let dist2 = max(dot(d, d), 1.0);  // clamp at 1m² to avoid singularity
-    let dist  = sqrt(dist2);
-    let accel = atr.w * dt / dist2;   // magnitude: strength/r²
+    let d    = atr.xyz - b.pos.xyz;
+    let dist = max(sqrt(dot(d, d)), 1.0);  // clamp at 1m to avoid singularity
+    let accel = atr.w * dt / (dist * dist);  // magnitude: strength/r²
     b.vel.x += (d.x / dist) * accel;
     b.vel.y += (d.y / dist) * accel;
     b.vel.z += (d.z / dist) * accel;
@@ -264,6 +266,87 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 `;
 
 // ---------------------------------------------------------------------------
+// WGSL: Stats reduction — computes per-workgroup partial stats,
+//       then CPU sums 256 partials. Called only on demand (MCP get_state).
+// ---------------------------------------------------------------------------
+const STATS_WG = 256; // workgroup count — 256×64 = 16384 threads cover 3M bodies in ~183 iters each
+const STATS_BYTES = STATS_WG * 8 * 4; // 8 f32 per workgroup × 256 × 4 bytes = 8192 bytes
+
+const STATS_WGSL = /* wgsl */`
+struct Body { pos: vec4f, vel: vec4f }
+struct WGStats { sumSpeed: f32, maxSpeed: f32, sumKE: f32, sumPx: f32, sumPy: f32, sumPz: f32, count: f32, _pad: f32 }
+
+@group(0) @binding(0) var<storage, read>       bodies  : array<Body>;
+@group(0) @binding(1) var<storage, read_write> statsOut: array<WGStats>;
+@group(0) @binding(2) var<uniform>             countVec: vec4u;
+
+var<workgroup> wgSpeed: array<f32, 64>;
+var<workgroup> wgMaxSp: array<f32, 64>;
+var<workgroup> wgKE   : array<f32, 64>;
+var<workgroup> wgPx   : array<f32, 64>;
+var<workgroup> wgPy   : array<f32, 64>;
+var<workgroup> wgPz   : array<f32, 64>;
+var<workgroup> wgCnt  : array<f32, 64>;
+
+@compute @workgroup_size(64)
+fn main(
+  @builtin(global_invocation_id) gid: vec3u,
+  @builtin(local_invocation_id)  lid: vec3u,
+  @builtin(workgroup_id)         wid: vec3u,
+) {
+  let tid    = lid.x;
+  let N      = countVec.x;
+  let stride = ${STATS_WG}u * 64u;
+
+  var sp = 0.0; var mx = 0.0; var ke = 0.0;
+  var px = 0.0; var py = 0.0; var pz = 0.0; var cnt = 0.0;
+
+  var i = gid.x;
+  while (i < N) {
+    let b    = bodies[i];
+    let invM = b.vel.w;
+    if (invM > 0.0) {
+      let v2 = dot(b.vel.xyz, b.vel.xyz);
+      let s  = sqrt(v2);
+      sp  += s;
+      mx   = max(mx, s);
+      ke  += 0.5 * v2 / invM;  // 0.5 * mass * v²
+      px  += b.pos.x;
+      py  += b.pos.y;
+      pz  += b.pos.z;
+      cnt += 1.0;
+    }
+    i += stride;
+  }
+
+  wgSpeed[tid] = sp; wgMaxSp[tid] = mx; wgKE[tid] = ke;
+  wgPx[tid] = px; wgPy[tid] = py; wgPz[tid] = pz; wgCnt[tid] = cnt;
+  workgroupBarrier();
+
+  for (var s = 32u; s > 0u; s >>= 1u) {
+    if (tid < s) {
+      wgSpeed[tid] += wgSpeed[tid + s];
+      wgMaxSp[tid]  = max(wgMaxSp[tid], wgMaxSp[tid + s]);
+      wgKE[tid]    += wgKE[tid + s];
+      wgPx[tid]    += wgPx[tid + s];
+      wgPy[tid]    += wgPy[tid + s];
+      wgPz[tid]    += wgPz[tid + s];
+      wgCnt[tid]   += wgCnt[tid + s];
+    }
+    workgroupBarrier();
+  }
+
+  if (tid == 0u) {
+    var out: WGStats;
+    out.sumSpeed = wgSpeed[0]; out.maxSpeed = wgMaxSp[0]; out.sumKE = wgKE[0];
+    out.sumPx = wgPx[0]; out.sumPy = wgPy[0]; out.sumPz = wgPz[0];
+    out.count = wgCnt[0]; out._pad = 0.0;
+    statsOut[wid.x] = out;
+  }
+}
+`;
+
+// ---------------------------------------------------------------------------
 // WGSL: Set all bodies' radius in one pass
 // ---------------------------------------------------------------------------
 const SET_RADIUS_WGSL = /* wgsl */`
@@ -312,6 +395,13 @@ export class GPUPhysicsWorld {
   private setRadiusBG: GPUBindGroup;
   private setRadiusParamBuf: GPUBuffer;
 
+  // Stats reduction (on-demand, for MCP get_state)
+  private statsPipe: GPUComputePipeline;
+  private statsBuf: GPUBuffer;
+  private statsReadBuf: GPUBuffer;
+  private statsParamBuf: GPUBuffer;
+  private statsBG: GPUBindGroup;
+
   readonly maxBodies: number;
   count = 0;
 
@@ -319,16 +409,12 @@ export class GPUPhysicsWorld {
   restitution = 0.7;
   damping = 0.995;
   wind = { x: 0, y: 0, z: 0 };
-  vortex = { centerX: 0, centerZ: 0, tangentialStrength: 0, inwardStrength: 0, liftStrength: 0, enabled: false };
+  vortex = { centerX: 0, centerZ: 0, tangentialStrength: 0, inwardStrength: 0, liftStrength: 0, centerY: 30, yConfinementStr: 0, enabled: false };
   walls = { halfWidth: 10, halfDepth: 10, enabled: false };
   explosion = { x: 0, y: 0, z: 0, strength: 0, radius: 0, enabled: false };
-  attractors: Array<{ x: number; y: number; z: number; strength: number }> = [
-    { x: 0, y: 0, z: 0, strength: 0 },
-    { x: 0, y: 0, z: 0, strength: 0 },
-    { x: 0, y: 0, z: 0, strength: 0 },
-    { x: 0, y: 0, z: 0, strength: 0 },
-    { x: 0, y: 0, z: 0, strength: 0 },
-  ];
+  attractors: Array<{ x: number; y: number; z: number; strength: number }> = Array.from(
+    { length: 64 }, () => ({ x: 0, y: 0, z: 0, strength: 0 }),
+  );
   fixedDt = 1 / 60;
 
   private constructor(device: GPUDevice, maxBodies: number) {
@@ -342,7 +428,7 @@ export class GPUPhysicsWorld {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
     this.paramsBuf = device.createBuffer({
-      size: 256, // 8 × vec4f base + 5 × vec4f attractors = 208 bytes, padded to 256
+      size: 1152, // 8 × vec4f base + 64 × vec4f attractors = 1152 bytes
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
     this.readBuf = device.createBuffer({
@@ -432,6 +518,31 @@ export class GPUPhysicsWorld {
       { binding: 0, resource: { buffer: this.bodyBuf } },
       { binding: 1, resource: { buffer: this.setRadiusParamBuf } },
     ]});
+
+    // Stats reduction pipeline
+    this.statsBuf = device.createBuffer({
+      size: STATS_BYTES,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    this.statsReadBuf = device.createBuffer({
+      size: STATS_BYTES,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    this.statsParamBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const statsBGL = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    ]});
+    this.statsPipe = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [statsBGL] }),
+      compute: { module: shader(STATS_WGSL), entryPoint: 'main' },
+    });
+    this.statsBG = device.createBindGroup({ layout: statsBGL, entries: [
+      { binding: 0, resource: { buffer: this.bodyBuf } },
+      { binding: 1, resource: { buffer: this.statsBuf } },
+      { binding: 2, resource: { buffer: this.statsParamBuf } },
+    ]});
   }
 
   static async create(maxBodies = 20000): Promise<GPUPhysicsWorld> {
@@ -475,6 +586,30 @@ export class GPUPhysicsWorld {
     this.count += actual;
   }
 
+  addBodiesShell(n: number, r: number, mass: number, shellRadius: number, thickness: number): void {
+    const actual = Math.min(n, this.maxBodies - this.count);
+    if (actual <= 0) return;
+    const invM = mass > 0 ? 1 / mass : 0;
+    const data = new Float32Array(actual * FLOATS_PER_BODY);
+    for (let i = 0; i < actual; i++) {
+      const o = i * FLOATS_PER_BODY;
+      // uniform point on sphere surface via normal distribution
+      const nx = (Math.random() * 2 - 1) + (Math.random() * 2 - 1) + (Math.random() * 2 - 1);
+      const ny = (Math.random() * 2 - 1) + (Math.random() * 2 - 1) + (Math.random() * 2 - 1);
+      const nz = (Math.random() * 2 - 1) + (Math.random() * 2 - 1) + (Math.random() * 2 - 1);
+      const len = Math.sqrt(nx*nx + ny*ny + nz*nz) || 1;
+      const rad = shellRadius + (Math.random() - 0.5) * thickness;
+      data[o]   = (nx / len) * rad;
+      data[o+1] = Math.max(r, (ny / len) * rad + shellRadius); // keep above floor
+      data[o+2] = (nz / len) * rad;
+      data[o+3] = r;
+      data[o+4] = 0; data[o+5] = 0; data[o+6] = 0;
+      data[o+7] = invM;
+    }
+    this.device.queue.writeBuffer(this.bodyBuf, this.count * FLOATS_PER_BODY * 4, data);
+    this.count += actual;
+  }
+
   setAllRadii(r: number): void {
     if (this.count === 0) return;
     this.device.queue.writeBuffer(this.setRadiusParamBuf, 0, new Float32Array([this.count, r, 0, 0]));
@@ -491,22 +626,26 @@ export class GPUPhysicsWorld {
     this.count = 0;
   }
 
+  removeSpheres(n: number): void {
+    this.count = Math.max(0, this.count - n);
+  }
+
   step(dt: number): void {
     if (this.count === 0) return;
 
-    // Write params: 8 × vec4f base (128 bytes) + 5 × vec4f attractors (80 bytes) = 208 bytes, padded to 256
-    const p = new Float32Array(64);
+    // Write params: 8 × vec4f base (128 bytes) + 64 × vec4f attractors (1024 bytes) = 1152 bytes
+    const p = new Float32Array(160);
     p[0] = this.gravity.x; p[1] = this.gravity.y; p[2] = this.gravity.z; p[3] = dt;
     p[4] = this.damping;   p[5] = this.restitution; p[6] = this.count;   p[7] = 0;
     p[8] = this.wind.x;    p[9] = this.wind.y;    p[10] = this.wind.z;  p[11] = 0;
     p[12] = this.vortex.centerX;           p[13] = this.vortex.centerZ;
     p[14] = this.vortex.tangentialStrength; p[15] = this.vortex.inwardStrength;
-    p[16] = this.vortex.liftStrength; p[17] = this.vortex.enabled ? 1 : 0; p[18] = 0; p[19] = 0;
+    p[16] = this.vortex.liftStrength; p[17] = this.vortex.enabled ? 1 : 0; p[18] = this.vortex.centerY; p[19] = this.vortex.yConfinementStr;
     p[20] = this.walls.halfWidth; p[21] = this.walls.halfDepth;
     p[22] = this.walls.enabled ? 1 : 0; p[23] = 0;
     p[24] = this.explosion.x; p[25] = this.explosion.y; p[26] = this.explosion.z; p[27] = this.explosion.strength;
     p[28] = this.explosion.radius; p[29] = this.explosion.enabled ? 1 : 0; p[30] = 0; p[31] = 0;
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 64; i++) {
       const a = this.attractors[i];
       p[32 + i * 4] = a.x; p[33 + i * 4] = a.y; p[34 + i * 4] = a.z; p[35 + i * 4] = a.strength;
     }
@@ -569,6 +708,49 @@ export class GPUPhysicsWorld {
   get gpuDevice(): GPUDevice { return this.device; }
   get bodyBuffer(): GPUBuffer { return this.bodyBuf; }
 
+  async computeStats(): Promise<{
+    count: number; avgSpeed: number; maxSpeed: number;
+    totalKE: number; centerOfMass: [number, number, number];
+  }> {
+    if (this.count === 0) return { count: 0, avgSpeed: 0, maxSpeed: 0, totalKE: 0, centerOfMass: [0, 0, 0] };
+
+    this.device.queue.writeBuffer(this.statsParamBuf, 0, new Uint32Array([this.count, 0, 0, 0]));
+
+    const enc = this.device.createCommandEncoder();
+    const pass = enc.beginComputePass();
+    pass.setPipeline(this.statsPipe);
+    pass.setBindGroup(0, this.statsBG);
+    pass.dispatchWorkgroups(STATS_WG);
+    pass.end();
+    enc.copyBufferToBuffer(this.statsBuf, 0, this.statsReadBuf, 0, STATS_BYTES);
+    this.device.queue.submit([enc.finish()]);
+
+    await this.statsReadBuf.mapAsync(GPUMapMode.READ, 0, STATS_BYTES);
+    const data = new Float32Array(this.statsReadBuf.getMappedRange(0, STATS_BYTES).slice(0));
+    this.statsReadBuf.unmap();
+
+    // Reduce 256 workgroup partials on CPU
+    let sumSpeed = 0, maxSpeed = 0, sumKE = 0, sumPx = 0, sumPy = 0, sumPz = 0, count = 0;
+    for (let i = 0; i < STATS_WG; i++) {
+      const b = i * 8;
+      sumSpeed += data[b + 0];
+      maxSpeed  = Math.max(maxSpeed, data[b + 1]);
+      sumKE    += data[b + 2];
+      sumPx    += data[b + 3];
+      sumPy    += data[b + 4];
+      sumPz    += data[b + 5];
+      count    += data[b + 6];
+    }
+    const n = count || 1;
+    return {
+      count: this.count,
+      avgSpeed: +(sumSpeed / n).toFixed(3),
+      maxSpeed: +maxSpeed.toFixed(3),
+      totalKE:  +sumKE.toFixed(1),
+      centerOfMass: [+(sumPx / n).toFixed(2), +(sumPy / n).toFixed(2), +(sumPz / n).toFixed(2)],
+    };
+  }
+
   async readPositions(): Promise<Float32Array> {
     const byteLen = this.count * FLOATS_PER_BODY * 4;
     if (byteLen === 0) return new Float32Array(0);
@@ -590,5 +772,8 @@ export class GPUPhysicsWorld {
     this.gridCountBuf.destroy();
     this.gridBodiesBuf.destroy();
     this.setRadiusParamBuf.destroy();
+    this.statsBuf.destroy();
+    this.statsReadBuf.destroy();
+    this.statsParamBuf.destroy();
   }
 }

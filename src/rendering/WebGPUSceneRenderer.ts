@@ -1,3 +1,80 @@
+// Glowing attractor marker shader — additive blending, pulsating billboard
+const ATR_MAX = 64;
+const ATTRACTOR_WGSL = /* wgsl */`
+struct AttractorParams {
+  points  : array<vec4f, ${ATR_MAX}>, // xyz = position, w = strength (0 = inactive)
+  timePad : vec4f,                    // x = time
+}
+struct Camera { viewProj: mat4x4f, view: mat4x4f, eyePos: vec4f }
+
+@group(0) @binding(0) var<uniform> atr: AttractorParams;
+@group(1) @binding(0) var<uniform> cam: Camera;
+
+const QUAD = array<vec2f, 6>(
+  vec2f(-1,-1), vec2f(1,-1), vec2f(-1,1),
+  vec2f(-1, 1), vec2f(1,-1), vec2f( 1,1),
+);
+
+struct VOut {
+  @builtin(position) pos : vec4f,
+  @location(0)       uv  : vec2f,
+  @location(1)       str : f32,
+  @location(2)       idx : f32,
+}
+
+// Procedural HSV→RGB so any number of attractors get distinct colors
+fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3f {
+  let c = v * s;
+  let x = c * (1.0 - abs(fract(h * 6.0) * 2.0 - 1.0));
+  let m = v - c;
+  let hi = u32(h * 6.0) % 6u;
+  var rgb: vec3f;
+  if      (hi == 0u) { rgb = vec3f(c, x, 0.0); }
+  else if (hi == 1u) { rgb = vec3f(x, c, 0.0); }
+  else if (hi == 2u) { rgb = vec3f(0.0, c, x); }
+  else if (hi == 3u) { rgb = vec3f(0.0, x, c); }
+  else if (hi == 4u) { rgb = vec3f(x, 0.0, c); }
+  else               { rgb = vec3f(c, 0.0, x); }
+  return rgb + m;
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+  let p = atr.points[ii];
+  var out: VOut;
+  out.str = p.w;
+  out.idx = f32(ii);
+  if (p.w == 0.0) {
+    out.pos = vec4f(0.0, 0.0, -2.0, 1.0);
+    out.uv  = vec2f(0.0);
+    return out;
+  }
+  let t     = atr.timePad.x;
+  let pulse = 1.0 + 0.18 * sin(t * 3.0 + f32(ii) * 1.31);
+  let r     = 4.0 * pulse;
+  let right = vec3f(cam.view[0][0], cam.view[1][0], cam.view[2][0]);
+  let up    = vec3f(cam.view[0][1], cam.view[1][1], cam.view[2][1]);
+  let local = QUAD[vi];
+  let wp    = p.xyz + right * (local.x * r) + up * (local.y * r);
+  out.pos   = cam.viewProj * vec4f(wp, 1.0);
+  out.uv    = local;
+  return out;
+}
+
+@fragment
+fn fs(in: VOut) -> @location(0) vec4f {
+  if (in.str == 0.0) { discard; }
+  let d    = length(in.uv);
+  if (d > 1.0) { discard; }
+  let core = 1.0 - smoothstep(0.0, 0.18, d);
+  let halo = pow(1.0 - d, 2.5) * 0.65;
+  let glow = core + halo;
+  let hue  = fract(in.idx / f32(${ATR_MAX})); // 均等に色相を分配
+  let col  = mix(hsv2rgb(hue, 0.85, 1.0), vec3f(1.0), core * 0.6);
+  return vec4f(col * glow, min(glow, 1.0));
+}
+`;
+
 // Body layout mirrors GPUPhysicsWorld: pos = (x,y,z,radius), vel = (vx,vy,vz,inverseMass)
 const SPHERE_WGSL = /* wgsl */`
 struct Body { pos: vec4f, vel: vec4f }
@@ -146,9 +223,13 @@ export class WebGPUSceneRenderer {
 
   private spherePipeline: GPURenderPipeline;
   private floorPipeline: GPURenderPipeline;
+  private attractorPipeline: GPURenderPipeline;
   private sphereBG0: GPUBindGroup;
   private sphereBG1: GPUBindGroup;
   private floorBG: GPUBindGroup;
+  private attractorBG0: GPUBindGroup;
+  private attractorBG1: GPUBindGroup;
+  private attractorBuf: GPUBuffer; // 5×vec4f(pos+str) + time + pad = 96 bytes
 
   // Orbit camera
   private azimuth = 0.3;
@@ -210,6 +291,24 @@ export class WebGPUSceneRenderer {
     this.sphereBG0 = device.createBindGroup({ layout: bodiesBGL, entries: [{ binding: 0, resource: { buffer: bodyBuf } }] });
     this.sphereBG1 = device.createBindGroup({ layout: camBGL,    entries: [{ binding: 0, resource: { buffer: this.camBuf } }] });
     this.floorBG   = device.createBindGroup({ layout: camBGL,    entries: [{ binding: 0, resource: { buffer: this.camBuf } }] });
+
+    // Attractor marker pipeline (additive blending, no depth write)
+    // 32 × vec4f(16B) + vec4f timePad(16B) = 528 bytes
+    this.attractorBuf = device.createBuffer({ size: ATR_MAX * 16 + 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const atrBGL = device.createBindGroupLayout({ entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+    ]});
+    const atrMod = device.createShaderModule({ code: ATTRACTOR_WGSL });
+    const additive: GPUBlendComponent = { srcFactor: 'src-alpha', dstFactor: 'one', operation: 'add' };
+    this.attractorPipeline = device.createRenderPipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [atrBGL, camBGL] }),
+      vertex:   { module: atrMod, entryPoint: 'vs' },
+      fragment: { module: atrMod, entryPoint: 'fs', targets: [{ format: this.format, blend: { color: additive, alpha: additive } }] },
+      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      depthStencil: { format: 'depth24plus', depthWriteEnabled: false, depthCompare: 'less' },
+    });
+    this.attractorBG0 = device.createBindGroup({ layout: atrBGL, entries: [{ binding: 0, resource: { buffer: this.attractorBuf } }] });
+    this.attractorBG1 = device.createBindGroup({ layout: camBGL, entries: [{ binding: 0, resource: { buffer: this.camBuf } }] });
 
     this.createDepthTex();
     this.setupInput();
@@ -291,6 +390,19 @@ export class WebGPUSceneRenderer {
     if (this.keys.has('q') || this.keys.has('shift'))      { this.tgt[1] -= spd; }
   }
 
+  setAttractors(points: Array<{ x: number; y: number; z: number; strength: number }>, time: number): void {
+    const data = new Float32Array(132); // 528 bytes / 4
+    for (let i = 0; i < ATR_MAX; i++) {
+      const p = points[i] ?? { x: 0, y: 0, z: 0, strength: 0 };
+      data[i * 4]     = p.x;
+      data[i * 4 + 1] = p.y;
+      data[i * 4 + 2] = p.z;
+      data[i * 4 + 3] = p.strength;
+    }
+    data[ATR_MAX * 4] = time; // timePad.x
+    this.device.queue.writeBuffer(this.attractorBuf, 0, data);
+  }
+
   render(count: number): void {
     const swapTex = this.context.getCurrentTexture();
     if (!swapTex || !this.depthTex) return;
@@ -322,6 +434,12 @@ export class WebGPUSceneRenderer {
       pass.setBindGroup(1, this.sphereBG1);
       pass.draw(6, count);
     }
+
+    // Attractor markers — up to 32 instances, additive glow
+    pass.setPipeline(this.attractorPipeline);
+    pass.setBindGroup(0, this.attractorBG0);
+    pass.setBindGroup(1, this.attractorBG1);
+    pass.draw(6, ATR_MAX);
 
     pass.end();
     this.device.queue.submit([enc.finish()]);
